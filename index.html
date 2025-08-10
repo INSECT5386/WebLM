@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tfjs + JSON tokenizer 텍스트 생성기</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.8.0/dist/tf.min.js"></script>
+<style>
+  body { max-width: 600px; margin: 2rem auto; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+  textarea { width: 100%; height: 3rem; font-size: 1rem; }
+  button { padding: 0.5rem 1rem; font-size: 1rem; margin-top: 1rem; cursor: pointer; }
+  #output { margin-top: 1rem; white-space: pre-wrap; background: #f5f5f5; padding: 1rem; border-radius: 5px; min-height: 4rem; }
+</style>
+</head>
+<body>
+
+<h1>tfjs + JSON tokenizer 텍스트 생성기</h1>
+
+<label for="promptInput">입력 문장:</label>
+<textarea id="promptInput" placeholder="여기에 문장 입력..."></textarea>
+
+<button id="generateBtn" disabled>생성 시작</button>
+
+<div id="output">토크나이저와 모델 로딩 중입니다. 잠시만 기다려주세요...</div>
+
+<script>
+  // 1. tokenizer JSON 로드
+  async function loadTokenizerJson(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('토크나이저 JSON 로드 실패');
+    return await res.json();
+  }
+
+  // 2. tokenizer 준비
+  function prepareTokenizer(tokenizerJson) {
+    const vocab = tokenizerJson.model.vocab;
+    const addedTokens = tokenizerJson.added_tokens;
+    const unkId = addedTokens.find(t => t.content === '<unk>').id;
+    const padId = addedTokens.find(t => t.content === '<pad>').id;
+    const startId = addedTokens.find(t => t.content === '<start>').id;
+    const sepId = addedTokens.find(t => t.content === '<sep>').id;
+    const endId = addedTokens.find(t => t.content === '<end>').id;
+
+    const idToToken = {};
+    for (const [token, id] of Object.entries(vocab)) {
+      idToToken[id] = token;
+    }
+
+    // 병합 알고리즘 무시한 단순 whitespace 토크나이징
+    function simpleTokenize(text) {
+      const tokens = text.split(/\s+/);
+      return tokens.map(t => (vocab[t] !== undefined ? vocab[t] : unkId));
+    }
+
+    function simpleDetokenize(ids) {
+      return ids.map(id => idToToken[id] || '<unk>').join(' ');
+    }
+
+    return {
+      vocab, unkId, padId, startId, sepId, endId,
+      simpleTokenize, simpleDetokenize
+    };
+  }
+
+  // 3. top-p 샘플링
+  function sampleTopP(logits, p = 0.9, temperature = 1.0) {
+    const logitsTensor = tf.tensor1d(logits).div(tf.scalar(temperature));
+    const probs = logitsTensor.softmax().arraySync();
+
+    const sorted = probs
+      .map((prob, idx) => [idx, prob])
+      .sort((a, b) => b[1] - a[1]);
+
+    let cumulative = 0;
+    let cutoffIndex = 0;
+    for (; cutoffIndex < sorted.length; cutoffIndex++) {
+      cumulative += sorted[cutoffIndex][1];
+      if (cumulative >= p) break;
+    }
+
+    const topTokens = sorted.slice(0, cutoffIndex + 1);
+    const topProbs = topTokens.map(x => x[1]);
+    const sumTopProbs = topProbs.reduce((a, b) => a + b, 0);
+    const normalizedProbs = topProbs.map(x => x / sumTopProbs);
+
+    const rnd = Math.random();
+    let acc = 0;
+    for (let i = 0; i < normalizedProbs.length; i++) {
+      acc += normalizedProbs[i];
+      if (rnd < acc) return topTokens[i][0];
+    }
+    return topTokens[0][0];
+  }
+
+  // 4. 텍스트 생성 함수
+  async function generateText(model, tokenizer, prompt, options = {}) {
+    const { maxLen = 100, maxGen = 98, p = 0.9, temperature = 0.8, minLen = 20 } = options;
+    const { simpleTokenize, simpleDetokenize, padId, endId } = tokenizer;
+
+    let inputText = `<start> ${prompt} <sep>`;
+    let generated = simpleTokenize(inputText);
+
+    for (let step = 0; step < maxGen; step++) {
+      const currentLen = generated.length;
+      let inputSeq = currentLen > maxLen ? generated.slice(-maxLen) : [...generated];
+
+      while (inputSeq.length < maxLen) inputSeq.push(padId);
+
+      const inputTensor = tf.tensor([inputSeq], [1, maxLen], 'int32');
+      const logitsTensor = model.predict(inputTensor);
+      const logits = await logitsTensor.array();
+      const pos = Math.min(currentLen, maxLen) - 1;
+      let nextTokenLogits = logits[0][pos];
+
+      if (endId !== undefined) nextTokenLogits[endId] -= 5.0;
+      if (padId !== undefined) nextTokenLogits[padId] -= 10.0;
+
+      const nextTokenId = sampleTopP(nextTokenLogits, p, temperature);
+      tf.dispose([inputTensor, logitsTensor]);
+
+      if (nextTokenId === endId && generated.length >= minLen) break;
+
+      generated.push(nextTokenId);
+    }
+
+    const fullText = simpleDetokenize(generated);
+    const sepIdx = fullText.indexOf('<sep>');
+    if (sepIdx !== -1) return fullText.slice(sepIdx + 5).trim();
+    return fullText.trim();
+  }
+
+  // 5. DOM 및 이벤트 핸들러 준비
+  const outputDiv = document.getElementById('output');
+  const promptInput = document.getElementById('promptInput');
+  const generateBtn = document.getElementById('generateBtn');
+
+  // 6. 초기화
+  (async () => {
+    try {
+      const tokenizerJsonUrl = './ko_bpe.json';    // 실제 JSON tokenizer 경로
+      const modelUrl = './tfjs_model/model.json';  // tfjs 변환 모델 경로
+
+      outputDiv.textContent = '토크나이저 로딩 중...';
+      const tokenizerJson = await loadTokenizerJson(tokenizerJsonUrl);
+      const tokenizer = prepareTokenizer(tokenizerJson);
+
+      outputDiv.textContent = '모델 로딩 중...';
+      const model = await tf.loadLayersModel(modelUrl);
+
+      outputDiv.textContent = '준비 완료! 문장을 입력하고 생성 버튼을 누르세요.';
+      generateBtn.disabled = false;
+
+      generateBtn.addEventListener('click', async () => {
+        const prompt = promptInput.value.trim();
+        if (!prompt) {
+          alert('문장을 입력해주세요!');
+          return;
+        }
+        outputDiv.textContent = '생성 중입니다... 잠시만요!';
+
+        try {
+          const result = await generateText(model, tokenizer, prompt);
+          outputDiv.textContent = `생성 결과:\n${result}`;
+        } catch (e) {
+          outputDiv.textContent = '오류 발생: ' + e.message;
+          console.error(e);
+        }
+      });
+    } catch (e) {
+      outputDiv.textContent = '초기화 오류: ' + e.message;
+      console.error(e);
+    }
+  })();
+</script>
+
+</body>
+</html>
